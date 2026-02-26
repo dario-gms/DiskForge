@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-DiskForge — Conversor de Discos Virtuais
+DiskForge — Conversor Universal de Discos Virtuais
 Compatível com Windows | Python 3.8+
-Baixa o qemu-img.exe automaticamente se necessário.
+qemu-img.exe embutido em tools/qemu/.
 """
 
 import tkinter as tk
@@ -15,22 +15,37 @@ import queue
 import time
 import re
 import shutil
-import urllib.request
-import zipfile
-import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta
 
 # ─── Constantes ─────────────────────────────────────────────────────
 
-APP_DIR   = Path(os.path.expanduser("~")) / ".diskforge"
-TOOLS_DIR = APP_DIR / "tools"
-QEMU_EXE  = TOOLS_DIR / "qemu-img.exe"
+SCRIPT_DIR = Path(os.path.abspath(sys.argv[0])).parent
+TOOLS_DIR  = SCRIPT_DIR / "tools" / "qemu"
+QEMU_EXE   = TOOLS_DIR / "qemu-img.exe"
 
-# Repositório que extrai qemu-img.exe + DLLs do instalador oficial (Stefan Weil)
-# A URL real do ZIP é descoberta via GitHub API em tempo de execução
-QEMU_GITHUB_API = "https://api.github.com/repos/fdcastel/qemu-img-windows-x64/releases/latest"
-QEMU_ZIP_NAME   = "qemu-img-portable.zip"
+# ─── Formatos suportados ─────────────────────────────────────────────
+
+FORMATS = {
+    "raw":       {"label": "RAW / IMG",     "ext": ".img",   "star": False,
+                  "desc": "Imagem setor a setor, universal e bootável"},
+    "qcow2":     {"label": "QCOW2",         "ext": ".qcow2", "star": True,
+                  "desc": "Formato nativo QEMU — snapshots e compressão"},
+    "vmdk":      {"label": "VMDK",          "ext": ".vmdk",  "star": False,
+                  "desc": "VMware / VirtualBox / QEMU"},
+    "vdi":       {"label": "VDI",           "ext": ".vdi",   "star": False,
+                  "desc": "VirtualBox Disk Image"},
+    "vhdx":      {"label": "VHDX",          "ext": ".vhdx",  "star": False,
+                  "desc": "Hyper-V (geração 2)"},
+    "vpc":       {"label": "VHD / VPC",     "ext": ".vhd",   "star": False,
+                  "desc": "Hyper-V legado / Virtual PC"},
+    "qcow":      {"label": "QCOW",          "ext": ".qcow",  "star": False,
+                  "desc": "QEMU Copy-On-Write v1 (legado)"},
+    "qed":       {"label": "QED",           "ext": ".qed",   "star": False,
+                  "desc": "QEMU Enhanced Disk (legado)"},
+    "parallels": {"label": "Parallels HDD", "ext": ".hdd",   "star": False,
+                  "desc": "Parallels Desktop para Mac"},
+}
 
 # ─── Paleta ─────────────────────────────────────────────────────────
 
@@ -40,49 +55,19 @@ C = {
     "surface2": "#1c2035",
     "border":   "#252a45",
     "accent":   "#4d7cfe",
-    "accent2":  "#7b5ea7",
     "success":  "#27c87a",
     "warning":  "#f5a623",
     "error":    "#f0445a",
     "text":     "#dde3f5",
     "text2":    "#8892b0",
     "text3":    "#4a5278",
+    "gold":     "#f5c842",
 }
 
 FF_MONO  = ("Courier New", 9)
-FF_UI    = ("Segoe UI",    10)
 FF_SMALL = ("Segoe UI",    8)
 FF_LABEL = ("Segoe UI",    9)
-FF_TITLE = ("Segoe UI",   17, "bold")
-
-# ─── Modos ──────────────────────────────────────────────────────────
-
-MODES = {
-    "vmdk_to_img": {
-        "label": "VMDK → Imagem Inicializável",
-        "icon":  "◈",
-        "desc":  "Converte disco VMDK em imagem .img bootável preservando todos os dados e partições.",
-        "steps": ["Validar origem", "Converter VMDK → RAW", "Verificar saída"],
-        "ext_in":  (".vmdk", "Disco VMDK (*.vmdk)"),
-        "ext_out": (".img",  "Imagem RAW (*.img)"),
-    },
-    "vdi_to_vmdk": {
-        "label": "VDI → VMDK",
-        "icon":  "⬡",
-        "desc":  "Converte disco VDI (VirtualBox) para formato VMDK compatível com VMware e QEMU.",
-        "steps": ["Validar origem", "Converter VDI → VMDK", "Verificar saída"],
-        "ext_in":  (".vdi",  "Disco VDI (*.vdi)"),
-        "ext_out": (".vmdk", "Disco VMDK (*.vmdk)"),
-    },
-    "vdi_to_img": {
-        "label": "VDI → Imagem Inicializável",
-        "icon":  "⬢",
-        "desc":  "Converte VDI em imagem bootável via pipeline interno: VDI → VMDK → IMG.",
-        "steps": ["Validar origem", "VDI → VMDK (temp)", "VMDK → Imagem RAW", "Finalizar"],
-        "ext_in":  (".vdi", "Disco VDI (*.vdi)"),
-        "ext_out": (".img", "Imagem RAW (*.img)"),
-    },
-}
+FF_TITLE = ("Segoe UI",   15, "bold")
 
 # ─── Utilitários ────────────────────────────────────────────────────
 
@@ -97,6 +82,7 @@ def human_size(path) -> str:
 
 def human_time(seconds: float) -> str:
     if seconds < 0 or seconds > 86400*7: return "—"
+    from datetime import timedelta
     td = timedelta(seconds=int(seconds))
     h, rem = divmod(td.seconds, 3600)
     m, s   = divmod(rem, 60)
@@ -105,201 +91,18 @@ def human_time(seconds: float) -> str:
     return f"{s}s"
 
 def qemu_path() -> str:
-    # Prioriza qemu-img no PATH do sistema, depois o local
-    if shutil.which("qemu-img"):
-        return "qemu-img"
     if QEMU_EXE.exists():
         return str(QEMU_EXE)
+    if shutil.which("qemu-img"):
+        return "qemu-img"
     return None
 
-def ensure_tools_dir():
-    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
-
-# ─── Download do qemu-img ────────────────────────────────────────────
-
-def _get_download_url(log_cb) -> str | None:
-    """
-    Descobre a URL do ZIP via GitHub API.
-    Retorna a URL do asset .zip da release mais recente do fdcastel/qemu-img-windows-x64.
-    """
-    import json
-    log_cb("info", "Consultando GitHub API para URL de download…")
-    try:
-        req = urllib.request.Request(
-            QEMU_GITHUB_API,
-            headers={"User-Agent": "DiskForge/1.0", "Accept": "application/vnd.github+json"}
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-
-        assets = data.get("assets", [])
-        for asset in assets:
-            name = asset.get("name", "")
-            if name.endswith(".zip") and "x64" in name.lower():
-                url = asset["browser_download_url"]
-                log_cb("ok", f"Encontrado: {name}")
-                log_cb("info", f"URL: {url}")
-                return url
-
-        # Se não achou asset .zip, tenta o zipball da release
-        zipball = data.get("zipball_url")
-        if zipball:
-            log_cb("warn", "Asset .zip não encontrado, usando zipball da release.")
-            return zipball
-
-        log_cb("error", "Nenhum asset .zip encontrado na release.")
-        return None
-
-    except Exception as e:
-        log_cb("error", f"Falha ao consultar GitHub API: {e}")
-        return None
-
-
-def _do_download(url: str, dest: Path, log_cb, progress_cb) -> bool:
-    """Faz o download com progresso."""
-    downloaded = [0]
-    total      = [0]
-    start_t    = [time.time()]
-
-    def reporthook(count, block_size, total_size):
-        downloaded[0] = min(count * block_size, total_size if total_size > 0 else count * block_size)
-        total[0]      = total_size if total_size > 0 else 1
-        pct     = min(99, downloaded[0] / total[0] * 100)
-        elapsed = time.time() - start_t[0]
-        speed   = downloaded[0] / elapsed if elapsed > 0 else 0
-        remain  = (total[0] - downloaded[0]) / speed if speed > 0 else 0
-        progress_cb(pct, speed, remain)
-        if count % 50 == 0:
-            log_cb("log", f"  {pct:.0f}%  {downloaded[0]//1024} KB / {total[0]//1024} KB"
-                          f"  [{speed/1024:.0f} KB/s  ETA {human_time(remain)}]")
-
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "DiskForge/1.0"})
-        with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
-            total_size = int(resp.headers.get("Content-Length", 0))
-            block = 65536
-            count = 0
-            while True:
-                chunk = resp.read(block)
-                if not chunk:
-                    break
-                f.write(chunk)
-                count += 1
-                reporthook(count, block, total_size)
-        return True
-    except Exception as e:
-        log_cb("error", f"Erro no download: {e}")
-        return False
-
-
-def _extract_zip(zip_path: Path, log_cb) -> bool:
-    """Extrai o ZIP achatando pastas, colocando tudo em TOOLS_DIR."""
-    try:
-        with zipfile.ZipFile(zip_path, "r") as z:
-            members = [m for m in z.namelist() if not m.endswith("/")]
-            log_cb("info", f"Extraindo {len(members)} arquivo(s)…")
-            for name in members:
-                filename = Path(name).name
-                if not filename:
-                    continue
-                data = z.read(name)
-                dest = TOOLS_DIR / filename
-                with open(dest, "wb") as f:
-                    f.write(data)
-                log_cb("log", f"  {filename}  ({len(data)//1024} KB)")
-        return True
-    except Exception as e:
-        log_cb("error", f"Erro ao extrair ZIP: {e}")
-        return False
-
-
-def download_qemu(progress_cb, log_cb):
-    """
-    Baixa o qemu-img.exe + todas as DLLs para Windows.
-    Usa o repositório fdcastel/qemu-img-windows-x64 (build do Stefan Weil, portátil).
-    A URL é descoberta em tempo real via GitHub API.
-    """
-    ensure_tools_dir()
-
-    # Limpa instalação anterior quebrada
-    for old in TOOLS_DIR.glob("*"):
-        try: old.unlink()
-        except: pass
-
-    log_cb("info", "=== Instalando qemu-img para Windows ===")
-    log_cb("info", f"Pasta de destino: {TOOLS_DIR}")
-
-    # 1. Descobre URL via GitHub API
-    url = _get_download_url(log_cb)
-    if not url:
-        log_cb("error", "Não foi possível obter a URL de download.")
-        log_cb("warn",  "Instale manualmente o QEMU de https://www.qemu.org/download/#windows")
-        log_cb("warn",  "Depois adicione a pasta do QEMU ao PATH do Windows.")
-        return False
-
-    # 2. Faz o download
-    zip_path = TOOLS_DIR / QEMU_ZIP_NAME
-    log_cb("info", "Baixando pacote…")
-    ok = _do_download(url, zip_path, log_cb, progress_cb)
-    if not ok:
-        return False
-    progress_cb(70, 0, 0)
-
-    # 3. Extrai
-    log_cb("info", "Extraindo arquivos…")
-    ok = _extract_zip(zip_path, log_cb)
-    zip_path.unlink(missing_ok=True)
-    if not ok:
-        return False
-    progress_cb(90, 0, 0)
-
-    # 4. Verifica se qemu-img.exe está presente
-    if not QEMU_EXE.exists():
-        # Procura em subpastas
-        found_list = list(TOOLS_DIR.rglob("qemu-img.exe"))
-        if found_list:
-            src_dir = found_list[0].parent
-            log_cb("info", f"qemu-img encontrado em: {src_dir} — copiando para {TOOLS_DIR}")
-            for f in src_dir.iterdir():
-                shutil.copy2(f, TOOLS_DIR / f.name)
-        else:
-            log_cb("error", "qemu-img.exe não encontrado no pacote.")
-            log_cb("warn",  "Instale manualmente: https://www.qemu.org/download/#windows")
-            return False
-
-    # 5. Testa execução
-    log_cb("info", "Testando qemu-img…")
-    try:
-        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        result = subprocess.run(
-            [str(QEMU_EXE), "--version"],
-            capture_output=True, text=True, timeout=10,
-            creationflags=flags
-        )
-        if result.returncode == 0:
-            ver = result.stdout.strip().splitlines()[0]
-            log_cb("ok", f"✓ {ver}")
-            log_cb("ok", "qemu-img instalado e funcionando!")
-            progress_cb(100, 0, 0)
-            return True
-        else:
-            code = result.returncode & 0xFFFFFFFF
-            log_cb("error", f"qemu-img falhou (código 0x{code:08X})")
-            if code == 0xC0000135:
-                log_cb("warn", "0xC0000135 = DLL ausente mesmo após extração.")
-                log_cb("warn", "Solução alternativa: instale o QEMU completo de")
-                log_cb("warn", "https://www.qemu.org/download/#windows e adicione ao PATH.")
-            return False
-    except Exception as e:
-        log_cb("error", f"Não foi possível executar qemu-img: {e}")
-        return False
-
-# ─── Conversores ────────────────────────────────────────────────────
+# ─── Conversor universal ─────────────────────────────────────────────
 
 def run_qemu(args: list, log_q: queue.Queue, prog_cb, eta_cb) -> int:
     exe = qemu_path()
     if not exe:
-        log_q.put(("error", "qemu-img não encontrado. Use o botão 'Instalar qemu-img'."))
+        log_q.put(("error", "qemu-img não encontrado em tools/qemu/."))
         return -1
 
     cmd = [exe] + args
@@ -314,267 +117,271 @@ def run_qemu(args: list, log_q: queue.Queue, prog_cb, eta_cb) -> int:
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
 
-        start_t  = time.time()
-        last_pct = [0.0]
+        start_t = time.time()
 
         for line in proc.stdout:
             line = line.rstrip()
             if not line:
                 continue
-
-            # qemu-img mostra: (XX.XX/100%)
             m = re.search(r"\((\d+(?:\.\d+)?)/100%\)", line)
             if m:
                 pct = float(m.group(1))
-                last_pct[0] = pct
                 elapsed = time.time() - start_t
                 if pct > 0:
-                    total_est = elapsed / (pct / 100)
-                    remain    = total_est - elapsed
-                    speed_str = f"{pct:.1f}%"
+                    remain = (elapsed / (pct / 100)) - elapsed
                     prog_cb(pct)
                     eta_cb(remain, pct)
-                log_q.put(("log", line))
-            else:
-                log_q.put(("log", line))
+            log_q.put(("log", line))
 
         proc.wait()
         rc = proc.returncode
-        if rc == -1073741515:  # 0xC0000135 - DLL não encontrada
-            log_q.put(("error", "Erro 0xC0000135: DLL ausente. O qemu-img.exe não consegue encontrar suas DLLs."))
-            log_q.put(("warn",  "Solução: Delete a pasta %USERPROFILE%\\.diskforge\\tools e clique em 'Instalar qemu-img' novamente."))
-            log_q.put(("warn",  "Alternativa: Instale o QEMU completo de https://www.qemu.org/download/#windows"))
+        if rc == -1073741515:
+            log_q.put(("error", "0xC0000135: DLL ausente — verifique a pasta tools/qemu/."))
         return rc
 
     except FileNotFoundError:
-        log_q.put(("error", "qemu-img.exe não encontrado no caminho especificado."))
+        log_q.put(("error", "qemu-img.exe não encontrado."))
         return -1
     except Exception as e:
         log_q.put(("error", str(e)))
         return -1
 
 
-def conv_vmdk_to_img(src, dst, log_q, prog_cb, step_cb, eta_cb):
+def conv_universal(src, dst, fmt_in, fmt_out, log_q, prog_cb, step_cb, eta_cb):
     step_cb(0)
     if not os.path.exists(src):
         log_q.put(("error", "Arquivo de origem não encontrado.")); return False
-    log_q.put(("ok", f"Origem: {src} ({human_size(src)})"))
+    log_q.put(("ok", f"Origem: {src}  ({human_size(src)})"))
+    log_q.put(("info", f"Conversão: {fmt_in.upper()} → {fmt_out.upper()}"))
     prog_cb(2)
 
     step_cb(1)
-    log_q.put(("info", "Convertendo VMDK → RAW (imagem inicializável)…"))
-    rc = run_qemu(["convert", "-p", "-f", "vmdk", "-O", "raw", src, dst],
+    rc = run_qemu(["convert", "-p", "-f", fmt_in, "-O", fmt_out, src, dst],
                   log_q, prog_cb, eta_cb)
     if rc != 0:
         log_q.put(("error", f"Conversão falhou (código {rc})")); return False
 
     step_cb(2)
-    log_q.put(("ok", f"Imagem gerada: {dst} ({human_size(dst)})"))
+    log_q.put(("ok", f"Arquivo gerado: {dst}  ({human_size(dst)})"))
     prog_cb(100)
     return True
 
 
-def conv_vdi_to_vmdk(src, dst, log_q, prog_cb, step_cb, eta_cb):
-    step_cb(0)
-    if not os.path.exists(src):
-        log_q.put(("error", "Arquivo de origem não encontrado.")); return False
-    log_q.put(("ok", f"Origem: {src} ({human_size(src)})"))
-    prog_cb(2)
+# ─── Widget: FormatPicker ────────────────────────────────────────────
 
-    step_cb(1)
-    log_q.put(("info", "Convertendo VDI → VMDK…"))
-    rc = run_qemu(["convert", "-p", "-f", "vdi", "-O", "vmdk", src, dst],
-                  log_q, prog_cb, eta_cb)
-    if rc != 0:
-        log_q.put(("error", f"Conversão falhou (código {rc})")); return False
+class FormatPicker(tk.Frame):
+    """Seletor de formato com dropdown customizado."""
 
-    step_cb(2)
-    log_q.put(("ok", f"VMDK gerado: {dst} ({human_size(dst)})"))
-    prog_cb(100)
-    return True
+    def __init__(self, parent, label_text, initial="qcow2", on_change=None, **kw):
+        super().__init__(parent, bg=C["bg"], **kw)
+        self._value     = initial
+        self._on_change = on_change
+        self._popup     = None
+
+        tk.Label(self, text=label_text, font=("Segoe UI",7,"bold"),
+                 fg=C["text3"], bg=C["bg"]).pack(anchor="w", pady=(0,4))
+
+        self._card = tk.Frame(self, bg=C["surface2"],
+                              highlightthickness=1,
+                              highlightbackground=C["border"],
+                              cursor="hand2")
+        self._card.pack(fill="x")
+
+        inner = tk.Frame(self._card, bg=C["surface2"])
+        inner.pack(fill="x", padx=10, pady=9)
+
+        self._ext_lbl  = tk.Label(inner, text="", font=("Courier New",9,"bold"),
+                                   fg=C["accent"], bg=C["surface2"], width=7, anchor="w")
+        self._ext_lbl.pack(side="left")
+
+        self._name_lbl = tk.Label(inner, text="", font=("Segoe UI",10,"bold"),
+                                   fg=C["text"], bg=C["surface2"])
+        self._name_lbl.pack(side="left")
+
+        self._star_lbl = tk.Label(inner, text="", font=("Segoe UI",9),
+                                   fg=C["gold"], bg=C["surface2"])
+        self._star_lbl.pack(side="left", padx=(3,0))
+
+        self._desc_lbl = tk.Label(inner, text="", font=FF_SMALL,
+                                   fg=C["text3"], bg=C["surface2"])
+        self._desc_lbl.pack(side="left", padx=(8,0))
+
+        tk.Label(inner, text="▾", font=("Segoe UI",12),
+                 fg=C["text3"], bg=C["surface2"]).pack(side="right")
+
+        for w in self._card.winfo_children() + [self._card]:
+            pass
+        self._bind_all_children(self._card, self._toggle)
+
+        self._refresh()
+
+    def _bind_all_children(self, widget, fn):
+        widget.bind("<Button-1>", fn)
+        widget.bind("<Enter>", lambda _: self._card.config(
+            highlightbackground=C["accent"]))
+        widget.bind("<Leave>", lambda _: self._popup or self._card.config(
+            highlightbackground=C["border"]))
+        for child in widget.winfo_children():
+            self._bind_all_children(child, fn)
+
+    def _refresh(self):
+        fmt = FORMATS[self._value]
+        self._ext_lbl.config(text=fmt["ext"])
+        self._name_lbl.config(text=fmt["label"])
+        self._star_lbl.config(text="★" if fmt["star"] else "")
+        self._desc_lbl.config(text=fmt["desc"])
+
+    def get(self): return self._value
+    def set(self, v):
+        self._value = v; self._refresh()
+
+    def _toggle(self, _=None):
+        if self._popup and self._popup.winfo_exists():
+            self._popup.destroy(); self._popup = None; return
+        self._open_popup()
+
+    def _open_popup(self):
+        self.update_idletasks()
+        x = self._card.winfo_rootx()
+        y = self._card.winfo_rooty() + self._card.winfo_height() + 2
+        w = self._card.winfo_width()
+        row_h = 34
+
+        pop = tk.Toplevel(self)
+        pop.wm_overrideredirect(True)
+        pop.geometry(f"{w}x{len(FORMATS)*row_h+2}+{x}+{y}")
+        pop.configure(bg=C["border"])
+        pop.lift()
+        self._popup = pop
+
+        wrap = tk.Frame(pop, bg=C["surface2"])
+        wrap.pack(fill="both", expand=True, padx=1, pady=1)
+
+        for key, info in FORMATS.items():
+            self._make_opt(wrap, key, info, row_h, pop)
+
+        pop.bind("<FocusOut>", lambda _: self._close_popup())
+        pop.focus_set()
+
+    def _make_opt(self, parent, key, info, row_h, pop):
+        sel = key == self._value
+        bg0 = C["surface"] if sel else C["surface2"]
+
+        row = tk.Frame(parent, bg=bg0, cursor="hand2", height=row_h)
+        row.pack(fill="x"); row.pack_propagate(False)
+
+        inn = tk.Frame(row, bg=bg0)
+        inn.pack(fill="both", expand=True, padx=10)
+
+        e = tk.Label(inn, text=info["ext"], font=("Courier New",8,"bold"),
+                     fg=C["accent"], bg=bg0, width=7, anchor="w")
+        e.pack(side="left")
+        n = tk.Label(inn, text=info["label"], font=FF_LABEL,
+                     fg=C["text"] if sel else C["text2"], bg=bg0)
+        n.pack(side="left")
+        if info["star"]:
+            tk.Label(inn, text=" ★", font=("Segoe UI",8),
+                     fg=C["gold"], bg=bg0).pack(side="left")
+        d = tk.Label(inn, text=info["desc"], font=FF_SMALL,
+                     fg=C["text3"], bg=bg0)
+        d.pack(side="right")
+
+        all_w = [row, inn, e, n, d]
+
+        def pick(k=key, p=pop):
+            self._value = k; self._refresh()
+            p.destroy(); self._popup = None
+            self._card.config(highlightbackground=C["border"])
+            if self._on_change: self._on_change(k)
+
+        def hov_on(_, ws=all_w):
+            for w in ws: w.config(bg=C["border"])
+        def hov_off(_, ws=all_w, bg=bg0):
+            for w in ws: w.config(bg=bg)
+
+        for w in all_w:
+            w.bind("<Button-1>", lambda _, f=pick: f())
+            w.bind("<Enter>", hov_on)
+            w.bind("<Leave>", hov_off)
+
+    def _close_popup(self):
+        if self._popup and self._popup.winfo_exists():
+            self._popup.destroy()
+        self._popup = None
 
 
-def conv_vdi_to_img(src, dst, log_q, prog_cb, step_cb, eta_cb):
-    step_cb(0)
-    if not os.path.exists(src):
-        log_q.put(("error", "Arquivo de origem não encontrado.")); return False
-    log_q.put(("ok", f"Origem: {src} ({human_size(src)})"))
-    prog_cb(2)
-
-    tmp = Path(dst).with_suffix("").with_name(Path(dst).stem + "_tmp_diskforge.vmdk")
-
-    step_cb(1)
-    log_q.put(("info", "Etapa 1/2 — VDI → VMDK intermediário…"))
-    rc = run_qemu(["convert", "-p", "-f", "vdi", "-O", "vmdk", src, str(tmp)],
-                  log_q,
-                  lambda p: prog_cb(p * 0.48),
-                  lambda r, p: eta_cb(r * 2, p / 2))
-    if rc != 0:
-        log_q.put(("error", f"Etapa 1 falhou (código {rc})")); return False
-    prog_cb(50)
-
-    step_cb(2)
-    log_q.put(("info", "Etapa 2/2 — VMDK → Imagem RAW…"))
-    rc = run_qemu(["convert", "-p", "-f", "vmdk", "-O", "raw", str(tmp), dst],
-                  log_q,
-                  lambda p: prog_cb(50 + p * 0.48),
-                  lambda r, p: eta_cb(r, 50 + p / 2))
-    try:
-        tmp.unlink()
-        log_q.put(("info", "Arquivo intermediário removido."))
-    except: pass
-
-    if rc != 0:
-        log_q.put(("error", f"Etapa 2 falhou (código {rc})")); return False
-
-    step_cb(3)
-    log_q.put(("ok", f"Imagem gerada: {dst} ({human_size(dst)})"))
-    prog_cb(100)
-    return True
-
-
-CONVERTERS = {
-    "vmdk_to_img": conv_vmdk_to_img,
-    "vdi_to_vmdk": conv_vdi_to_vmdk,
-    "vdi_to_img":  conv_vdi_to_img,
-}
-
-# ─── Widgets ────────────────────────────────────────────────────────
-
-class NavButton(tk.Frame):
-    def __init__(self, parent, key, icon, label, on_click, **kw):
-        super().__init__(parent, bg=C["surface"], cursor="hand2", **kw)
-        self.key = key
-        self._on_click = on_click
-        self._active = False
-
-        self._indicator = tk.Frame(self, bg=C["surface"], width=3)
-        self._indicator.pack(side="left", fill="y")
-
-        inner = tk.Frame(self, bg=C["surface"])
-        inner.pack(side="left", fill="x", expand=True, padx=(8,12), pady=8)
-
-        self._icon_lbl = tk.Label(inner, text=icon, font=("Segoe UI",12),
-                                  fg=C["text3"], bg=C["surface"])
-        self._icon_lbl.pack(side="left")
-
-        self._text_lbl = tk.Label(inner, text=label, font=FF_LABEL,
-                                  fg=C["text2"], bg=C["surface"], anchor="w")
-        self._text_lbl.pack(side="left", padx=8, fill="x", expand=True)
-
-        for w in [self, inner, self._icon_lbl, self._text_lbl]:
-            w.bind("<Button-1>", lambda _: self._on_click(self.key))
-            w.bind("<Enter>", self._hover_on)
-            w.bind("<Leave>", self._hover_off)
-
-    def set_active(self, active: bool):
-        self._active = active
-        bg   = C["surface2"] if active else C["surface"]
-        fg_i = C["accent"]   if active else C["text3"]
-        fg_t = C["text"]     if active else C["text2"]
-        ind  = C["accent"]   if active else C["surface"]
-        self.config(bg=bg)
-        self._indicator.config(bg=ind)
-        self._icon_lbl.config(fg=fg_i, bg=bg)
-        self._text_lbl.config(fg=fg_t, bg=bg)
-        for w in self.winfo_children():
-            if isinstance(w, tk.Frame) and w != self._indicator:
-                w.config(bg=bg)
-
-    def _hover_on(self, _):
-        if not self._active:
-            self.config(bg=C["surface2"])
-            for w in self.winfo_children():
-                w.config(bg=C["surface2"])
-    def _hover_off(self, _):
-        if not self._active:
-            self.config(bg=C["surface"])
-            for w in self.winfo_children():
-                w.config(bg=C["surface"])
-
+# ─── Widget: ProgressBar ────────────────────────────────────────────
 
 class ProgressBar(tk.Canvas):
-    def __init__(self, parent, height=8, **kw):
+    def __init__(self, parent, height=7, **kw):
         super().__init__(parent, height=height, bg=C["border"],
                          highlightthickness=0, **kw)
-        self._pct   = 0
-        self._anim  = 0
-        self._h     = height
-        self.bind("<Configure>", self._on_resize)
-        self._bar = self.create_rectangle(0, 0, 0, height,
-                                          fill=C["accent"], outline="")
-        self._glow = self.create_oval(0, -4, 0, height+4,
-                                      fill=C["accent"], outline="",
-                                      stipple="gray50")
-        self._animate()
-
-    def _on_resize(self, e):
-        self._redraw()
+        self._pct = 0; self._anim = 0; self._h = height
+        self.bind("<Configure>", lambda _: self._redraw())
+        self._bar  = self.create_rectangle(0,0,0,height, fill=C["accent"], outline="")
+        self._glow = self.create_oval(0,-4,0,height+4, fill=C["accent"],
+                                      outline="", stipple="gray50")
+        self._tick()
 
     def _redraw(self):
         w = self.winfo_width()
-        fill_w = int(w * self._pct / 100)
-        self.coords(self._bar, 0, 0, fill_w, self._h)
-        gw = 24
-        self.coords(self._glow, fill_w - gw, -2, fill_w + 4, self._h + 2)
+        fw = int(w * self._pct / 100)
+        self.coords(self._bar, 0, 0, fw, self._h)
+        self.coords(self._glow, fw-24, -2, fw+4, self._h+2)
 
-    def set(self, pct: float):
-        self._pct = max(0.0, min(100.0, pct))
-        self._redraw()
+    def set(self, pct):
+        self._pct = max(0.0, min(100.0, pct)); self._redraw()
 
-    def _animate(self):
-        # Pulsa o brilho da ponta
-        self._anim = (self._anim + 1) % 20
-        alpha = abs(self._anim - 10) / 10
-        color = self._lerp_color(C["accent"], "#ffffff", alpha * 0.3)
-        self.itemconfig(self._glow, fill=color)
-        self.after(60, self._animate)
+    def _tick(self):
+        self._anim = (self._anim+1) % 20
+        a = abs(self._anim-10)/10
+        c = self._lerp(C["accent"], "#ffffff", a*0.3)
+        self.itemconfig(self._glow, fill=c)
+        self.after(60, self._tick)
 
     @staticmethod
-    def _lerp_color(c1, c2, t):
-        r1,g1,b1 = int(c1[1:3],16), int(c1[3:5],16), int(c1[5:7],16)
-        r2,g2,b2 = int(c2[1:3],16), int(c2[3:5],16), int(c2[5:7],16)
-        r = int(r1 + (r2-r1)*t); g = int(g1 + (g2-g1)*t); b = int(b1 + (b2-b1)*t)
-        return f"#{r:02x}{g:02x}{b:02x}"
+    def _lerp(c1, c2, t):
+        r1,g1,b1=int(c1[1:3],16),int(c1[3:5],16),int(c1[5:7],16)
+        r2,g2,b2=int(c2[1:3],16),int(c2[3:5],16),int(c2[5:7],16)
+        return f"#{int(r1+(r2-r1)*t):02x}{int(g1+(g2-g1)*t):02x}{int(b1+(b2-b1)*t):02x}"
 
+
+# ─── Widget: StepList ───────────────────────────────────────────────
 
 class StepList(tk.Frame):
     def __init__(self, parent, steps, **kw):
         super().__init__(parent, bg=C["bg"], **kw)
         self._rows = []
         for s in steps:
-            row = tk.Frame(self, bg=C["bg"])
-            row.pack(anchor="w", pady=3)
-            dot = tk.Label(row, text="○", font=("Segoe UI",11),
+            row = tk.Frame(self, bg=C["bg"]); row.pack(anchor="w", pady=2)
+            dot = tk.Label(row, text="○", font=("Segoe UI",10),
                            fg=C["text3"], bg=C["bg"], width=2)
             dot.pack(side="left")
-            lbl = tk.Label(row, text=s, font=FF_LABEL,
-                           fg=C["text3"], bg=C["bg"])
+            lbl = tk.Label(row, text=s, font=FF_LABEL, fg=C["text3"], bg=C["bg"])
             lbl.pack(side="left", padx=4)
             self._rows.append((dot, lbl))
 
     def activate(self, idx):
-        for i, (dot, lbl) in enumerate(self._rows):
-            if i < idx:
-                dot.config(text="●", fg=C["success"]); lbl.config(fg=C["text2"])
-            elif i == idx:
-                dot.config(text="◉", fg=C["accent"]);  lbl.config(fg=C["text"])
-            else:
-                dot.config(text="○", fg=C["text3"]);   lbl.config(fg=C["text3"])
+        for i,(d,l) in enumerate(self._rows):
+            if i<idx:   d.config(text="●",fg=C["success"]); l.config(fg=C["text2"])
+            elif i==idx:d.config(text="◉",fg=C["accent"]);  l.config(fg=C["text"])
+            else:       d.config(text="○",fg=C["text3"]);   l.config(fg=C["text3"])
 
     def complete(self):
-        for dot, lbl in self._rows:
-            dot.config(text="●", fg=C["success"]); lbl.config(fg=C["success"])
+        for d,l in self._rows:
+            d.config(text="●",fg=C["success"]); l.config(fg=C["success"])
 
     def reset(self):
-        for dot, lbl in self._rows:
-            dot.config(text="○", fg=C["text3"]); lbl.config(fg=C["text3"])
+        for d,l in self._rows:
+            d.config(text="○",fg=C["text3"]); l.config(fg=C["text3"])
 
+
+# ─── Widget: FileRow ────────────────────────────────────────────────
 
 class FileRow(tk.Frame):
     def __init__(self, parent, label, var, browse_cmd, **kw):
         super().__init__(parent, bg=C["bg"], **kw)
-        tk.Label(self, text=label.upper(), font=("Segoe UI",8,"bold"),
+        tk.Label(self, text=label.upper(), font=("Segoe UI",7,"bold"),
                  fg=C["text3"], bg=C["bg"]).pack(anchor="w", pady=(0,4))
 
         box = tk.Frame(self, bg=C["surface2"],
@@ -583,10 +390,12 @@ class FileRow(tk.Frame):
 
         self._entry = tk.Entry(box, textvariable=var, font=FF_LABEL,
                                bg=C["surface2"], fg=C["text"], relief="flat",
-                               insertbackground=C["accent"], bd=8)
+                               insertbackground=C["accent"], bd=7)
         self._entry.pack(side="left", fill="x", expand=True)
-        self._entry.bind("<FocusIn>",  lambda _: box.config(highlightbackground=C["accent"]))
-        self._entry.bind("<FocusOut>", lambda _: box.config(highlightbackground=C["border"]))
+        self._entry.bind("<FocusIn>",
+            lambda _: box.config(highlightbackground=C["accent"]))
+        self._entry.bind("<FocusOut>",
+            lambda _: box.config(highlightbackground=C["border"]))
 
         btn = tk.Label(box, text="  Procurar  ", font=FF_SMALL,
                        fg=C["accent"], bg=C["surface2"], cursor="hand2")
@@ -604,325 +413,255 @@ class FileRow(tk.Frame):
 
 # ─── App principal ───────────────────────────────────────────────────
 
+CONV_STEPS = ["Validar origem", "Converter", "Verificar saída"]
+
 class DiskForge(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("DiskForge")
         self.configure(bg=C["bg"])
         self.resizable(True, True)
-        self.minsize(820, 620)
+        self.minsize(860, 680)
 
-        self._mode    = "vmdk_to_img"
         self._src_var = tk.StringVar()
         self._dst_var = tk.StringVar()
         self._running = False
         self._log_q   = queue.Queue()
-        self._nav_btns: dict[str, NavButton] = {}
         self._steps_widget: StepList = None
 
         self._src_var.trace_add("write", self._on_src_change)
-
         self._build()
         self._center()
-        self._select_mode("vmdk_to_img")
         self._check_deps_async()
         self._poll()
 
     def _center(self):
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        w, h = 900, 700
-        self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+        w, h   = 980, 760
+        self.geometry(f"{w}x{h}+{max(0,(sw-w)//2)}+{max(0,(sh-h)//2)}")
 
     # ─── Build ───────────────────────────────────────────────────────
 
     def _build(self):
         # ── Sidebar ──────────────────────────────────────────────────
-        self._sidebar = tk.Frame(self, bg=C["surface"], width=230)
-        self._sidebar.pack(side="left", fill="y")
-        self._sidebar.pack_propagate(False)
+        sb = tk.Frame(self, bg=C["surface"], width=215)
+        sb.pack(side="left", fill="y"); sb.pack_propagate(False)
 
         # Logo
-        lf = tk.Frame(self._sidebar, bg=C["surface"])
-        lf.pack(fill="x", padx=18, pady=(26,0))
-        tk.Label(lf, text="◈", font=("Segoe UI",26), fg=C["accent"],
+        lf = tk.Frame(sb, bg=C["surface"])
+        lf.pack(fill="x", padx=14, pady=(20,0))
+        tk.Label(lf, text="◈", font=("Segoe UI",22), fg=C["accent"],
                  bg=C["surface"]).pack(side="left")
-        nf = tk.Frame(lf, bg=C["surface"])
-        nf.pack(side="left", padx=10)
-        tk.Label(nf, text="DiskForge", font=("Segoe UI",14,"bold"),
+        nf = tk.Frame(lf, bg=C["surface"]); nf.pack(side="left", padx=8)
+        tk.Label(nf, text="DiskForge", font=("Segoe UI",12,"bold"),
                  fg=C["text"], bg=C["surface"]).pack(anchor="w")
-        tk.Label(nf, text="v1.0  •  Conversor de Discos", font=FF_SMALL,
+        tk.Label(nf, text="v1.2.0  •  Conversor Universal", font=("Segoe UI",7),
                  fg=C["text3"], bg=C["surface"]).pack(anchor="w")
 
-        self._sep(self._sidebar)
+        tk.Frame(sb, bg=C["border"], height=1).pack(fill="x", padx=12, pady=12)
 
-        tk.Label(self._sidebar, text="OPERAÇÕES", font=("Segoe UI",8,"bold"),
-                 fg=C["text3"], bg=C["surface"]).pack(anchor="w", padx=18, pady=(0,6))
+        # Status qemu
+        tk.Label(sb, text="FERRAMENTAS", font=("Segoe UI",7,"bold"),
+                 fg=C["text3"], bg=C["surface"]).pack(anchor="w", padx=14, pady=(0,5))
+        dep = tk.Frame(sb, bg=C["surface"]); dep.pack(fill="x", padx=14)
+        self._qemu_dot = tk.Label(dep, text="○", font=("Segoe UI",10),
+                                   fg=C["text3"], bg=C["surface"])
+        self._qemu_dot.pack(side="left")
+        tk.Label(dep, text="qemu-img", font=FF_SMALL,
+                 fg=C["text2"], bg=C["surface"]).pack(side="left", padx=6)
 
-        for key, info in MODES.items():
-            btn = NavButton(self._sidebar, key, info["icon"], info["label"],
-                            self._select_mode)
-            btn.pack(fill="x", padx=6, pady=1)
-            self._nav_btns[key] = btn
+        tk.Frame(sb, bg=C["border"], height=1).pack(fill="x", padx=12, pady=12)
 
-        self._sep(self._sidebar)
+        # Lista de formatos
+        tk.Label(sb, text="FORMATOS SUPORTADOS", font=("Segoe UI",7,"bold"),
+                 fg=C["text3"], bg=C["surface"]).pack(anchor="w", padx=14, pady=(0,6))
+        for key, info in FORMATS.items():
+            row = tk.Frame(sb, bg=C["surface"]); row.pack(fill="x", padx=14, pady=1)
+            tk.Label(row, text=info["ext"], font=("Courier New",8),
+                     fg=C["accent"], bg=C["surface"], width=7, anchor="w").pack(side="left")
+            lbl = info["label"] + (" ★" if info["star"] else "")
+            tk.Label(row, text=lbl, font=("Segoe UI",8),
+                     fg=C["gold"] if info["star"] else C["text2"],
+                     bg=C["surface"]).pack(side="left")
 
-        # Dependências
-        tk.Label(self._sidebar, text="FERRAMENTAS", font=("Segoe UI",8,"bold"),
-                 fg=C["text3"], bg=C["surface"]).pack(anchor="w", padx=18, pady=(0,6))
-
-        self._dep_frame = tk.Frame(self._sidebar, bg=C["surface"])
-        self._dep_frame.pack(fill="x", padx=18)
-        self._qemu_dot  = self._dep_row("qemu-img")
-
-        install_row = tk.Frame(self._sidebar, bg=C["surface"])
-        install_row.pack(fill="x", padx=14, pady=(8,0))
-        self._install_btn = tk.Label(install_row, text="⬇  Instalar qemu-img",
-                                     font=FF_SMALL, fg=C["accent"],
-                                     bg=C["surface"], cursor="hand2", padx=4)
-        self._install_btn.pack(anchor="w")
-        self._install_btn.bind("<Button-1>", lambda _: self._install_qemu())
-
-        # Versão
-        tk.Label(self._sidebar, text="CentOS 7 / VMDK / VDI",
-                 font=FF_SMALL, fg=C["text3"], bg=C["surface"]).pack(
-                 side="bottom", pady=12)
-
-        # ── Main ─────────────────────────────────────────────────────
+        # ── Main area ─────────────────────────────────────────────────
         main = tk.Frame(self, bg=C["bg"])
         main.pack(side="left", fill="both", expand=True)
 
+        # Bottom bar — empacotado antes do conteúdo para garantir visibilidade
+        bot = tk.Frame(main, bg=C["surface"])
+        bot.pack(fill="x", side="bottom")
+        bi = tk.Frame(bot, bg=C["surface"]); bi.pack(fill="x", padx=24, pady=10)
+        self._status_lbl = tk.Label(bi, text="Pronto.", font=FF_LABEL,
+                                    fg=C["text2"], bg=C["surface"])
+        self._status_lbl.pack(side="left")
+        self._go_btn = tk.Button(bi, text="▶  Iniciar Conversão",
+                                 font=("Segoe UI",10,"bold"),
+                                 bg=C["accent"], fg=C["text"], relief="flat",
+                                 bd=0, padx=18, pady=8, cursor="hand2",
+                                 activebackground="#3a6be0",
+                                 activeforeground=C["text"],
+                                 command=self._start_conversion)
+        self._go_btn.pack(side="right")
+
+        # Área de conteúdo scrollável
+        body = tk.Frame(main, bg=C["bg"])
+        body.pack(fill="both", expand=True)
+
         # Header
-        hdr = tk.Frame(main, bg=C["bg"])
-        hdr.pack(fill="x", padx=30, pady=(26,0))
-        self._title_lbl = tk.Label(hdr, text="", font=FF_TITLE,
-                                   fg=C["text"], bg=C["bg"])
-        self._title_lbl.pack(anchor="w")
-        self._desc_lbl  = tk.Label(hdr, text="", font=FF_LABEL,
-                                   fg=C["text2"], bg=C["bg"],
-                                   wraplength=540, justify="left")
-        self._desc_lbl.pack(anchor="w", pady=(4,0))
+        hdr = tk.Frame(body, bg=C["bg"])
+        hdr.pack(fill="x", padx=24, pady=(18,0))
+        tk.Label(hdr, text="Conversor Universal de Discos", font=FF_TITLE,
+                 fg=C["text"], bg=C["bg"]).pack(anchor="w")
+        tk.Label(hdr, text="Converta entre qualquer combinação: RAW, QCOW2, VMDK, VDI, VHDX, VHD e mais.",
+                 font=FF_LABEL, fg=C["text2"], bg=C["bg"],
+                 wraplength=600, justify="left").pack(anchor="w", pady=(3,0))
 
-        tk.Frame(main, bg=C["border"], height=1).pack(fill="x", padx=30, pady=14)
+        tk.Frame(body, bg=C["border"], height=1).pack(fill="x", padx=24, pady=(12,10))
 
-        # Content
-        content = tk.Frame(main, bg=C["bg"])
-        content.pack(fill="x", padx=30)
+        # ── Seletores de formato ──────────────────────────────────────
+        fmt_row = tk.Frame(body, bg=C["bg"])
+        fmt_row.pack(fill="x", padx=24, pady=(0,10))
 
-        left  = tk.Frame(content, bg=C["bg"])
-        left.pack(side="left", fill="x", expand=True)
+        self._fmt_in = FormatPicker(fmt_row, "FORMATO DE ENTRADA",
+                                    initial="vmdk", on_change=self._on_fmt_change)
+        self._fmt_in.pack(side="left", fill="x", expand=True)
 
-        right = tk.Frame(content, bg=C["bg"], width=190)
-        right.pack(side="right", fill="y", padx=(20,0))
-        right.pack_propagate(False)
-        tk.Label(right, text="ETAPAS", font=("Segoe UI",8,"bold"),
-                 fg=C["text3"], bg=C["bg"]).pack(anchor="w", pady=(0,8))
-        self._steps_container = right
+        arrow = tk.Frame(fmt_row, bg=C["bg"], width=46)
+        arrow.pack(side="left"); arrow.pack_propagate(False)
+        tk.Label(arrow, text="→", font=("Segoe UI",18),
+                 fg=C["accent"], bg=C["bg"]).place(relx=0.5, rely=0.5, anchor="center")
 
-        # Arquivos
+        self._fmt_out = FormatPicker(fmt_row, "FORMATO DE SAÍDA",
+                                     initial="qcow2", on_change=self._on_fmt_change)
+        self._fmt_out.pack(side="left", fill="x", expand=True)
+
+        tk.Frame(body, bg=C["border"], height=1).pack(fill="x", padx=24, pady=(4,10))
+
+        # ── Arquivos + Etapas ─────────────────────────────────────────
+        files = tk.Frame(body, bg=C["bg"]); files.pack(fill="x", padx=24)
+
+        left = tk.Frame(files, bg=C["bg"]); left.pack(side="left", fill="x", expand=True)
+
+        right = tk.Frame(files, bg=C["bg"], width=175)
+        right.pack(side="right", fill="y", padx=(14,0)); right.pack_propagate(False)
+        tk.Label(right, text="ETAPAS", font=("Segoe UI",7,"bold"),
+                 fg=C["text3"], bg=C["bg"]).pack(anchor="w", pady=(2,5))
+        self._steps_widget = StepList(right, CONV_STEPS)
+        self._steps_widget.pack(anchor="w")
+
         self._src_row = FileRow(left, "Arquivo de Origem",
                                 self._src_var, self._browse_src)
-        self._src_row.pack(fill="x", pady=(0,12))
+        self._src_row.pack(fill="x", pady=(0,8))
 
         self._dst_row = FileRow(left, "Arquivo de Destino",
                                 self._dst_var, self._browse_dst)
         self._dst_row.pack(fill="x")
 
         # ── Progresso ────────────────────────────────────────────────
-        prog_area = tk.Frame(main, bg=C["bg"])
-        prog_area.pack(fill="x", padx=30, pady=(18,0))
+        prog = tk.Frame(body, bg=C["bg"]); prog.pack(fill="x", padx=24, pady=(12,0))
 
-        # Stats row
-        stats = tk.Frame(prog_area, bg=C["bg"])
-        stats.pack(fill="x", pady=(0,6))
+        stats = tk.Frame(prog, bg=C["bg"]); stats.pack(fill="x", pady=(0,4))
+        self._pct_lbl = tk.Label(stats, text="", font=("Segoe UI",10,"bold"),
+                                  fg=C["accent"], bg=C["bg"]); self._pct_lbl.pack(side="left")
+        self._eta_lbl = tk.Label(stats, text="", font=FF_SMALL,
+                                  fg=C["text3"], bg=C["bg"]); self._eta_lbl.pack(side="right")
+        self._spd_lbl = tk.Label(stats, text="", font=FF_SMALL,
+                                  fg=C["text3"], bg=C["bg"]); self._spd_lbl.pack(side="right", padx=14)
 
-        self._pct_lbl  = tk.Label(stats, text="",    font=("Segoe UI",11,"bold"),
-                                  fg=C["accent"], bg=C["bg"])
-        self._pct_lbl.pack(side="left")
-
-        self._eta_lbl  = tk.Label(stats, text="",    font=FF_SMALL,
-                                  fg=C["text3"], bg=C["bg"])
-        self._eta_lbl.pack(side="right")
-
-        self._spd_lbl  = tk.Label(stats, text="",    font=FF_SMALL,
-                                  fg=C["text3"], bg=C["bg"])
-        self._spd_lbl.pack(side="right", padx=16)
-
-        self._progress = ProgressBar(prog_area, height=8)
+        self._progress = ProgressBar(prog, height=7)
         self._progress.pack(fill="x")
 
         # ── Log ──────────────────────────────────────────────────────
-        log_wrap = tk.Frame(main, bg=C["surface2"])
-        log_wrap.pack(fill="both", expand=True, padx=30, pady=(14,0))
+        log_wrap = tk.Frame(body, bg=C["surface2"])
+        log_wrap.pack(fill="both", expand=True, padx=24, pady=(10,0))
 
-        log_hdr = tk.Frame(log_wrap, bg=C["surface2"])
-        log_hdr.pack(fill="x", padx=10, pady=(8,2))
-        tk.Label(log_hdr, text="SAÍDA", font=("Segoe UI",8,"bold"),
+        lh = tk.Frame(log_wrap, bg=C["surface2"]); lh.pack(fill="x", padx=10, pady=(6,2))
+        tk.Label(lh, text="SAÍDA", font=("Segoe UI",7,"bold"),
                  fg=C["text3"], bg=C["surface2"]).pack(side="left")
-        _clear_btn = tk.Label(log_hdr, text="limpar", font=FF_SMALL, fg=C["text3"],
-                              bg=C["surface2"], cursor="hand2")
-        _clear_btn.pack(side="right")
-        _clear_btn.bind("<Button-1>", lambda _: self._log_txt.delete("1.0","end"))
+        clr = tk.Label(lh, text="limpar", font=FF_SMALL, fg=C["text3"],
+                       bg=C["surface2"], cursor="hand2"); clr.pack(side="right")
+        clr.bind("<Button-1>", lambda _: self._log_txt.delete("1.0","end"))
 
         self._log_txt = tk.Text(log_wrap, bg=C["surface2"], fg=C["text2"],
                                 font=FF_MONO, relief="flat", wrap="word",
                                 selectbackground=C["accent"],
-                                highlightthickness=0, bd=0)
-        sb = ttk.Scrollbar(log_wrap, command=self._log_txt.yview)
-        self._log_txt.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y", pady=4, padx=(0,4))
-        self._log_txt.pack(side="left", fill="both", expand=True,
-                           padx=(10,0), pady=(0,8))
+                                highlightthickness=0, bd=0, height=7)
+        sb2 = ttk.Scrollbar(log_wrap, command=self._log_txt.yview)
+        self._log_txt.configure(yscrollcommand=sb2.set)
+        sb2.pack(side="right", fill="y", pady=4, padx=(0,3))
+        self._log_txt.pack(side="left", fill="both", expand=True, padx=(10,0), pady=(0,6))
 
         for tag, fg in [("info",C["text2"]),("ok",C["success"]),
-                        ("error",C["error"]),("warn",C["warning"]),
-                        ("log",C["text3"])]:
+                        ("error",C["error"]),("warn",C["warning"]),("log",C["text3"])]:
             self._log_txt.tag_config(tag, foreground=fg)
 
-        # ── Bottom bar ───────────────────────────────────────────────
-        bot = tk.Frame(main, bg=C["surface"])
-        bot.pack(fill="x", side="bottom")
-        inner = tk.Frame(bot, bg=C["surface"])
-        inner.pack(fill="x", padx=30, pady=12)
+    # ─── Eventos ─────────────────────────────────────────────────────
 
-        self._status_lbl = tk.Label(inner, text="Pronto.", font=FF_LABEL,
-                                    fg=C["text2"], bg=C["surface"])
-        self._status_lbl.pack(side="left")
-
-        self._go_btn = tk.Button(inner, text="▶  Iniciar Conversão",
-                                 font=("Segoe UI",10,"bold"),
-                                 bg=C["accent"], fg=C["text"],
-                                 relief="flat", bd=0, padx=18, pady=8,
-                                 cursor="hand2", activebackground="#3a6be0",
-                                 activeforeground=C["text"],
-                                 command=self._start_conversion)
-        self._go_btn.pack(side="right")
-
-    def _sep(self, parent):
-        tk.Frame(parent, bg=C["border"], height=1).pack(
-            fill="x", padx=14, pady=16)
-
-    def _dep_row(self, name):
-        row = tk.Frame(self._dep_frame, bg=C["surface"])
-        row.pack(fill="x", pady=2)
-        dot = tk.Label(row, text="○", font=("Segoe UI",10),
-                       fg=C["text3"], bg=C["surface"])
-        dot.pack(side="left")
-        tk.Label(row, text=name, font=FF_SMALL, fg=C["text2"],
-                 bg=C["surface"]).pack(side="left", padx=6)
-        return dot
-
-    # ─── Modo ────────────────────────────────────────────────────────
-
-    def _select_mode(self, key: str):
-        self._mode = key
-        info = MODES[key]
-
-        for k, btn in self._nav_btns.items():
-            btn.set_active(k == key)
-
-        self._title_lbl.config(text=info["label"])
-        self._desc_lbl.config(text=info["desc"])
-
-        # Rebuilds steps
-        if self._steps_widget:
-            self._steps_widget.destroy()
-        self._steps_widget = StepList(self._steps_container, info["steps"])
-        self._steps_widget.pack(anchor="w")
-
-        self._auto_dst()
+    def _on_fmt_change(self, _=None): self._auto_dst()
 
     def _on_src_change(self, *_):
         p = self._src_var.get()
-        if os.path.exists(p):
-            self._src_row.set_info(f"Tamanho: {human_size(p)}", C["text3"])
-        else:
-            self._src_row.set_info("")
+        self._src_row.set_info(f"Tamanho: {human_size(p)}" if os.path.exists(p) else "")
         self._auto_dst()
 
     def _auto_dst(self):
         src = self._src_var.get()
         if not src: return
-        info = MODES[self._mode]
-        stem   = Path(src).stem
-        folder = Path(src).parent
-        ext    = info["ext_out"][0]
-        self._dst_var.set(str(folder / f"{stem}_converted{ext}"))
+        ext = FORMATS[self._fmt_out.get()]["ext"]
+        self._dst_var.set(str(Path(src).parent / f"{Path(src).stem}_converted{ext}"))
 
     def _browse_src(self):
-        ext, label = MODES[self._mode]["ext_in"]
+        fmt = FORMATS[self._fmt_in.get()]
         p = filedialog.askopenfilename(
-            title=f"Selecionar {label}",
-            filetypes=[(label, f"*{ext}"), ("Todos", "*.*")])
+            title=f"Selecionar {fmt['label']}",
+            filetypes=[(f"{fmt['label']} (*{fmt['ext']})", f"*{fmt['ext']}"),
+                       ("Todos", "*.*")])
         if p: self._src_var.set(p)
 
     def _browse_dst(self):
-        ext, label = MODES[self._mode]["ext_out"]
+        fmt = FORMATS[self._fmt_out.get()]
         p = filedialog.asksaveasfilename(
             title="Salvar como",
-            defaultextension=ext,
-            filetypes=[(label, f"*{ext}")])
+            defaultextension=fmt["ext"],
+            filetypes=[(f"{fmt['label']} (*{fmt['ext']})", f"*{fmt['ext']}")])
         if p: self._dst_var.set(p)
 
     # ─── Deps ────────────────────────────────────────────────────────
 
     def _check_deps_async(self):
-        def _check():
+        def _chk():
             ok = bool(qemu_path())
-            self.after(0, lambda: self._set_dep(self._qemu_dot, ok))
-            self.after(0, lambda: self._install_btn.config(
-                fg=C["text3"] if ok else C["accent"],
-                cursor="arrow" if ok else "hand2"))
-        threading.Thread(target=_check, daemon=True).start()
-
-    def _set_dep(self, dot, ok):
-        dot.config(text="●" if ok else "✕",
-                   fg=C["success"] if ok else C["error"])
-
-    def _install_qemu(self):
-        if qemu_path():
-            messagebox.showinfo("Já instalado",
-                                f"qemu-img já está disponível:\n{qemu_path()}")
-            return
-        if self._running:
-            return
-        self._running = True
-        self._go_btn.config(state="disabled")
-        self._status_lbl.config(text="Baixando qemu-img…", fg=C["warning"])
-        self._progress.set(0)
-        self._log_txt.delete("1.0", "end")
-
-        def _dl_progress(pct, speed, remain):
-            self.after(0, lambda: self._progress.set(pct))
-            self.after(0, lambda: self._pct_lbl.config(text=f"{pct:.0f}%"))
-            self.after(0, lambda: self._eta_lbl.config(
-                text=f"ETA {human_time(remain)}"))
-            self.after(0, lambda: self._spd_lbl.config(
-                text=f"{speed/1024:.0f} KB/s"))
-
-        def _worker():
-            ok = download_qemu(
-                _dl_progress,
-                lambda kind, msg: self._log_q.put((kind, msg))
-            )
-            self._log_q.put(("__install_done__", ok))
-
-        threading.Thread(target=_worker, daemon=True).start()
+            self.after(0, lambda: self._qemu_dot.config(
+                text="●" if ok else "✕",
+                fg=C["success"] if ok else C["error"]))
+            if not ok:
+                self.after(0, lambda: messagebox.showwarning(
+                    "qemu-img não encontrado",
+                    f"Não foi possível encontrar tools/qemu/qemu-img.exe.\n\n"
+                    f"Certifique-se de que a pasta tools/qemu/ está junto ao script:\n"
+                    f"{SCRIPT_DIR}"))
+        threading.Thread(target=_chk, daemon=True).start()
 
     # ─── Conversão ───────────────────────────────────────────────────
 
     def _start_conversion(self):
         if self._running: return
-        src = self._src_var.get().strip()
-        dst = self._dst_var.get().strip()
+        src, dst       = self._src_var.get().strip(), self._dst_var.get().strip()
+        fmt_in, fmt_out = self._fmt_in.get(), self._fmt_out.get()
 
         if not qemu_path():
             messagebox.showwarning("qemu-img não encontrado",
-                "Clique em 'Instalar qemu-img' na barra lateral antes de converter.")
+                "Certifique-se de que a pasta tools/qemu/ está junto ao script.")
+            return
+        if fmt_in == fmt_out:
+            messagebox.showwarning("Formatos iguais",
+                "O formato de entrada e saída são iguais. Escolha formatos diferentes.")
             return
         if not src or not dst:
             messagebox.showwarning("Campos obrigatórios",
-                "Preencha origem e destino antes de iniciar.")
+                "Preencha os caminhos de origem e destino antes de iniciar.")
             return
         if not os.path.exists(src):
             messagebox.showerror("Arquivo não encontrado",
@@ -934,38 +673,31 @@ class DiskForge(tk.Tk):
         self._status_lbl.config(text="Processando…", fg=C["warning"])
         self._progress.set(0)
         self._pct_lbl.config(text="0%")
-        self._eta_lbl.config(text="")
-        self._spd_lbl.config(text="")
+        self._eta_lbl.config(text=""); self._spd_lbl.config(text="")
         self._steps_widget.reset()
         self._log_txt.delete("1.0","end")
         self._log_append("info",
-            f"[{datetime.now():%H:%M:%S}] Iniciando: {MODES[self._mode]['label']}\n")
+            f"Iniciando: {FORMATS[fmt_in]['label']} → {FORMATS[fmt_out]['label']}")
 
-        start_ref = [time.time()]
-        last_pct  = [0.0]
+        t0 = [time.time()]
 
         def prog_cb(pct):
             pct = max(0.0, min(100.0, pct))
-            last_pct[0] = pct
             self.after(0, lambda: self._progress.set(pct))
             self.after(0, lambda: self._pct_lbl.config(text=f"{pct:.1f}%"))
 
         def eta_cb(remain, pct):
-            elapsed = time.time() - start_ref[0]
-            if pct > 1:
-                total_est = elapsed / (pct / 100)
-                remain    = max(0, total_est - elapsed)
-            self.after(0, lambda: self._eta_lbl.config(
-                text=f"ETA: {human_time(remain)}"))
-            self.after(0, lambda: self._spd_lbl.config(
-                text=f"Decorrido: {human_time(elapsed)}"))
+            elapsed = time.time() - t0[0]
+            if pct > 1: remain = max(0, elapsed/(pct/100) - elapsed)
+            self.after(0, lambda: self._eta_lbl.config(text=f"ETA: {human_time(remain)}"))
+            self.after(0, lambda: self._spd_lbl.config(text=f"Decorrido: {human_time(elapsed)}"))
 
         def step_cb(idx):
             self.after(0, lambda: self._steps_widget.activate(idx))
 
         def worker():
-            fn = CONVERTERS[self._mode]
-            ok = fn(src, dst, self._log_q, prog_cb, step_cb, eta_cb)
+            ok = conv_universal(src, dst, fmt_in, fmt_out,
+                                self._log_q, prog_cb, step_cb, eta_cb)
             self._log_q.put(("__done__", ok))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -976,7 +708,6 @@ class DiskForge(tk.Tk):
         try:
             while True:
                 kind, msg = self._log_q.get_nowait()
-
                 if kind == "__done__":
                     self._running = False
                     self._go_btn.config(state="normal", text="▶  Iniciar Conversão")
@@ -987,20 +718,8 @@ class DiskForge(tk.Tk):
                             f"Arquivo gerado com sucesso:\n\n{self._dst_var.get()}")
                     else:
                         self._status_lbl.config(text="Falha. Veja o log.", fg=C["error"])
-
-                elif kind == "__install_done__":
-                    self._running = False
-                    self._go_btn.config(state="normal")
-                    self._check_deps_async()
-                    if msg:
-                        self._status_lbl.config(text="qemu-img instalado!", fg=C["success"])
-                        messagebox.showinfo("Instalado!", "qemu-img instalado com sucesso.")
-                    else:
-                        self._status_lbl.config(text="Falha no download.", fg=C["error"])
-                        messagebox.showerror("Erro", "Não foi possível baixar o qemu-img.\nVerifique sua conexão e tente novamente.")
                 else:
                     self._log_append(kind, msg)
-
         except queue.Empty:
             pass
         self.after(80, self._poll)
@@ -1017,7 +736,7 @@ class DiskForge(tk.Tk):
 if __name__ == "__main__":
     try:
         from ctypes import windll
-        windll.shcore.SetProcessDpiAwareness(1)  # HiDPI no Windows
+        windll.shcore.SetProcessDpiAwareness(1)
     except: pass
 
     app = DiskForge()
