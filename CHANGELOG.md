@@ -32,8 +32,6 @@
 
 ### 📋 Requisitos
 - Windows 10/11 (64-bit)
-- Python 3.8+
-- tkinter (incluído no Python padrão)
 - Sem dependências externas
 
 ---
