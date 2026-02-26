@@ -456,7 +456,7 @@ class DiskForge(tk.Tk):
         nf = tk.Frame(lf, bg=C["surface"]); nf.pack(side="left", padx=8)
         tk.Label(nf, text="DiskForge", font=("Segoe UI",12,"bold"),
                  fg=C["text"], bg=C["surface"]).pack(anchor="w")
-        tk.Label(nf, text="v1.2.0  •  Conversor Universal", font=("Segoe UI",7),
+        tk.Label(nf, text="v1.1.0  •  Conversor Universal", font=("Segoe UI",7),
                  fg=C["text3"], bg=C["surface"]).pack(anchor="w")
 
         tk.Frame(sb, bg=C["border"], height=1).pack(fill="x", padx=12, pady=12)
