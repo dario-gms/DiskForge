@@ -9,7 +9,7 @@ Converta discos entre qualquer combinação de formatos — RAW, QCOW2, VMDK, VD
 [![Python](https://img.shields.io/badge/Python-3.8%2B-4d7cfe?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Windows](https://img.shields.io/badge/Windows-10%2F11-4d7cfe?style=flat-square&logo=windows&logoColor=white)](https://microsoft.com/windows)
 [![Licença](https://img.shields.io/badge/Licen%C3%A7a-MIT-27c87a?style=flat-square)](LICENSE)
-[![Versão](https://img.shields.io/badge/Vers%C3%A3o-1.2.0-f5a623?style=flat-square)]()
+[![Versão](https://img.shields.io/badge/Vers%C3%A3o-1.1.0-f5a623?style=flat-square)]()
 
 </div>
 
@@ -62,46 +62,34 @@ Qualquer combinação de entrada e saída é suportada. Por exemplo: VMDK → QC
 | Componente | Versão |
 |-----------|--------|
 | Sistema operacional | Windows 10 ou 11 (64-bit) |
-| Python | 3.8 ou superior |
-| tkinter | Incluído no instalador padrão do CPython para Windows |
-| qemu-img | **Embutido** em `tools/qemu/` — nenhuma instalação necessária |
+| Python | **Não necessário** (embutido no executável) |
 | Conexão com internet | **Não necessária** |
-| Espaço em disco | ~50 MB para os arquivos do DiskForge + tamanho da imagem gerada |
+| Espaço em disco | ~80-150 MB para o DiskForge.exe + tamanho da imagem gerada |
 
 ---
 
 ## Instalação e uso
 
-### 1. Instale o Python
+### 1. Baixe o DiskForge
 
-Baixe o Python 3.8 ou superior em [python.org/downloads](https://python.org/downloads).  
-Durante a instalação, marque a opção **"Add Python to PATH"**.
-
-### 2. Baixe o DiskForge
-
-Baixe e extraia o DiskForge. A estrutura de pastas deve ser:
+Baixe e extraia o `DiskForge-1.1.0-Windows.zip`. Dentro dele você encontrará:
 
 ```
-DiskForge/
-├── disk_converter.py     ← script principal
-├── DiskForge.pyw         ← launcher sem terminal (duplo clique)
-└── tools/
-    └── qemu/
-        ├── qemu-img.exe
-        └── *.dll
+DiskForge-1.1.0-Windows/
+└── DiskForge.exe     ← Execute este arquivo!
 ```
 
-### 3. Execute
+### 2. Execute
 
-**Opção A — Sem terminal (recomendado):** Dê duplo clique em `DiskForge.pyw`.
+Dê **duplo clique em `DiskForge.exe`**. Pronto! A janela abrirá imediatamente com a ferramenta pronta para uso.
 
-**Opção B — Via terminal:** Abra o PowerShell na pasta e execute:
+Não requer:
+- ❌ Instalar Python
+- ❌ Abrir terminal
+- ❌ Configurar nada
+- ❌ Estar conectado à internet
 
-```powershell
-python disk_converter.py
-```
-
-A janela do DiskForge abrirá imediatamente com o `qemu-img` já detectado e pronto para uso.
+**É só duplo clique!** 🚀
 
 ---
 
@@ -207,8 +195,9 @@ VBoxManage convertfromraw "disco.img" "disco.vdi" --format VDI
 
 | Camada | Tecnologia |
 |--------|-----------|
+| Distribuição | `PyInstaller 6.x` — Executável Windows compilado, autocontido |
 | Interface gráfica | `tkinter` (stdlib Python) — widgets customizados com `Canvas` e `Toplevel` |
-| Motor de conversão | `qemu-img` embutido em `tools/qemu/` |
+| Motor de conversão | `qemu-img` embutido no executável |
 | Threading | `threading.Thread` — conversão em thread separada; polling via `Tk.after(80ms)` |
 | Comunicação entre threads | `queue.Queue` — passagem de mensagens thread-safe |
 | Controle de processos | `subprocess.Popen` com `CREATE_NO_WINDOW`; stdout lido linha a linha |
@@ -239,20 +228,21 @@ eta = total_estimado - tempo_decorrido
 
 ## Solução de problemas
 
-### `python` não é reconhecido no PowerShell
+### Não consigo executar o arquivo
 
-O Python não está na variável `PATH`. Reinstale marcando **"Add Python to PATH"**, ou use o caminho completo:
-```powershell
-C:\Python312\python.exe disk_converter.py
-```
+- Verifique se é realmente `DiskForge.exe` (e não `DiskForge.spec` ou outro arquivo)
+- Tente clicar com botão direito → "Executar como administrador"
+- Verifique se não foi bloqueado (clique direito → Propriedades → Desbloquear)
 
-### qemu-img não encontrado ao abrir o programa
+### Antivírus bloqueia o arquivo
 
-Verifique se a pasta `tools/qemu/` está na mesma pasta que o `disk_converter.py` e contém o `qemu-img.exe` e todas as DLLs.
+PyInstaller às vezes causa falsos positivos em antivírus. Isso é normal. Você pode:
+1. Adicionar uma exclusão para `DiskForge.exe` no seu antivírus
+2. Reportar o arquivo ao fabricante do antivírus como falso positivo
 
-### Conversão falha com código `3221225781` (0xC0000135)
+### Conversão falha ou não inicia
 
-Uma DLL necessária está faltando. Verifique se todos os arquivos da pasta `tools/qemu/` estão presentes (não apenas o `.exe`).
+Verifique se você tem espaço em disco suficiente para a imagem de saída. Uma conversão de disco de 100 GB precisa de 100+ GB livres no disco.
 
 ### Arquivo de saída maior que o esperado
 
