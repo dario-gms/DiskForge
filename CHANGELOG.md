@@ -25,10 +25,10 @@
 - Tratamento robusto de erros com mensagens informativas
 
 ### 📦 Distribuição
-- **Um único arquivo Python** — não requer instalação
-- `qemu-img` já embutido em `tools/qemu/` — sem downloads adicionais
-- Executável direto via duplo clique em `DiskForge.pyw`
-- ~50 MB total (ferramenta + binários)
+- **Executável Windows compilado** (`DiskForge.exe`) — pronto para usar, sem instalação
+- Python já embutido no executável — sem dependências externas
+- Clique duplo para executar — não requer terminal ou Python instalado
+- ~80-150 MB total (tudo incluído)
 
 ### 📋 Requisitos
 - Windows 10/11 (64-bit)
