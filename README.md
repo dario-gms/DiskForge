@@ -119,6 +119,7 @@ Não requer:
 │  Pronto.                               ▶ Iniciar Conversão         │
 └────────────────────────────────────────────────────────────────────┘
 ```
+![DiskForge](resources/images/diskforge.png)
 
 ### Seletor de formato
 
